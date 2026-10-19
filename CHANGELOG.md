@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Trim trailing room noise and the stop-key click from each dictation before decoding,
+  so Whisper no longer invents a closing "Thank you." for the silent tail.
+- Drop decoded segments that the microphone contradicts (text stamped over a span
+  with no speech energy), in both the final transcript and the live preview.
+- Judge each segment by its own token confidence instead of the whole-window value
+  WhisperKit copies onto every segment.
+
 ## 0.2.0 — 2026-08-18
 
 - Added live dictation preview at the active text cursor.

@@ -10,6 +10,7 @@ class WhisperService: ObservableObject {
     private var realtimeSessionID = UUID()
     private var realtimeCaptureActive = false
     private var realtimeStartFailure: String?
+    private var realtimeVoicedFrames: [Bool] = []
 
     @Published var isModelLoaded = false
     @Published var isModelAsleep = false
@@ -201,6 +202,18 @@ class WhisperService: ObservableObject {
             throw WhisperSwiftKeyError.modelNotLoaded
         }
 
+        // Whisper invents closing phrases ("Thank you.", "Bye.") when a window ends in
+        // room noise or the key click that stopped the recording. Decode only the stretch
+        // that contains speech; WhisperKit pads the rest with digital silence, which the
+        // model was trained on and rarely misreads.
+        guard let speechSamples = SpeechActivityDetector.trimmedToSpeech(samples) else {
+            print("[WhisperService] No sustained speech in \(samples.count) samples, skipping decode")
+            return ""
+        }
+        if speechSamples.count != samples.count {
+            print("[WhisperService] Trimmed capture from \(samples.count) to \(speechSamples.count) samples around speech")
+        }
+
         // Build prompt tokens from custom dictionary string
         var promptTokens: [Int]? = nil
         if let prompt = prompt, let tokenizer = kit.tokenizer {
@@ -210,35 +223,25 @@ class WhisperService: ObservableObject {
             }
         }
 
-        let options = DecodingOptions(
-            language: language,
-            usePrefillPrompt: true,
-            detectLanguage: language == nil,
-            skipSpecialTokens: true,
-            promptTokens: promptTokens
-        )
+        let options = Self.decodingOptions(language: language, promptTokens: promptTokens)
+        let results = await kit.transcribe(audioArrays: [speechSamples], decodeOptions: options)
 
-        let results = await kit.transcribe(audioArrays: [samples], decodeOptions: options)
-
-        // Filter segment-by-segment so hallucinated phrases decoded from silent
-        // stretches (e.g. a trailing "Thank you.") are dropped while real speech
+        // Filter segment-by-segment against the audio that was actually decoded, so a
+        // hallucinated phrase stamped over a silent stretch is dropped while real speech
         // in the same recording is kept.
+        let voicedFrames = SpeechActivityDetector.voicedFrameMask(speechSamples)
+        let specialTokenBegin = kit.tokenizer?.specialTokens.specialTokenBegin
         let segmentTexts = results
             .compactMap { $0 }
             .flatMap { $0 }
             .flatMap { $0.segments }
-            .compactMap { segment -> String? in
-                let cleaned = Self.stripWhisperTokens(segment.text)
-                guard !cleaned.isEmpty else { return nil }
-                if Self.isLikelyHallucination(
-                    text: cleaned,
-                    noSpeechProb: segment.noSpeechProb,
-                    avgLogprob: segment.avgLogprob
-                ) {
-                    print("[WhisperService] Dropped likely hallucinated segment \"\(cleaned)\" (noSpeechProb=\(segment.noSpeechProb), avgLogprob=\(segment.avgLogprob))")
-                    return nil
-                }
-                return cleaned
+            .compactMap { segment in
+                Self.acceptedSegmentText(
+                    segment,
+                    voicedFrames: voicedFrames,
+                    specialTokenBegin: specialTokenBegin,
+                    logRejections: true
+                )
             }
 
         let text = segmentTexts
@@ -247,6 +250,69 @@ class WhisperService: ObservableObject {
 
         print("[WhisperService] Transcribed: \(text.prefix(100))")
         return text
+    }
+
+    private static func decodingOptions(language: String?, promptTokens: [Int]?) -> DecodingOptions {
+        DecodingOptions(
+            language: language,
+            usePrefillPrompt: true,
+            detectLanguage: language == nil,
+            skipSpecialTokens: true,
+            promptTokens: promptTokens
+        )
+    }
+
+    /// The segment's cleaned text, or nil when it is empty or judged a hallucination.
+    private static func acceptedSegmentText(
+        _ segment: TranscriptionSegment,
+        voicedFrames: [Bool],
+        specialTokenBegin: Int?,
+        logRejections: Bool
+    ) -> String? {
+        let cleaned = stripWhisperTokens(segment.text)
+        guard !cleaned.isEmpty else { return nil }
+
+        let evidence = SpeechActivityDetector.speechEvidence(
+            voicedFrames: voicedFrames,
+            from: segment.start,
+            to: segment.end
+        )
+        let avgLogprob = segmentAverageLogprob(
+            tokenLogProbs: segment.tokenLogProbs,
+            specialTokenBegin: specialTokenBegin,
+            fallback: segment.avgLogprob
+        )
+        if isLikelyHallucination(
+            text: cleaned,
+            noSpeechProb: segment.noSpeechProb,
+            avgLogprob: avgLogprob,
+            speechEvidence: evidence
+        ) {
+            if logRejections {
+                print("[WhisperService] Dropped likely hallucinated segment \"\(cleaned)\" (\(segment.start)s-\(segment.end)s, speech=\(evidence), avgLogprob=\(avgLogprob), noSpeechProb=\(segment.noSpeechProb))")
+            }
+            return nil
+        }
+        return cleaned
+    }
+
+    /// Average log probability of a segment's own text tokens. WhisperKit copies the whole
+    /// 30-second window's average onto every segment in it, so a hallucinated tail inherits
+    /// the confidence of the real speech decoded before it; the per-token values are the
+    /// only per-segment confidence signal available.
+    static func segmentAverageLogprob(tokenLogProbs: [[Int: Float]], specialTokenBegin: Int?, fallback: Float) -> Float {
+        var sum: Float = 0
+        var count = 0
+        for entry in tokenLogProbs {
+            for (token, logprob) in entry {
+                if let specialTokenBegin, token >= specialTokenBegin { continue }
+                guard logprob.isFinite else { continue }
+                sum += logprob
+                count += 1
+            }
+        }
+        guard count > 0 else { return fallback }
+        return sum / Float(count)
     }
 
     func startRealtimeTranscription(
@@ -267,6 +333,7 @@ class WhisperService: ObservableObject {
         kit.audioProcessor.purgeAudioSamples(keepingLast: 0)
         realtimeCaptureActive = false
         realtimeStartFailure = nil
+        realtimeVoicedFrames = []
 
         var promptTokens: [Int]? = nil
         if let prompt, !prompt.isEmpty {
@@ -276,13 +343,8 @@ class WhisperService: ObservableObject {
             }
         }
 
-        let options = DecodingOptions(
-            language: language,
-            usePrefillPrompt: true,
-            detectLanguage: language == nil,
-            skipSpecialTokens: true,
-            promptTokens: promptTokens
-        )
+        let options = Self.decodingOptions(language: language, promptTokens: promptTokens)
+        let specialTokenBegin = tokenizer.specialTokens.specialTokenBegin
 
         let sessionID = UUID()
         realtimeSessionID = sessionID
@@ -297,18 +359,31 @@ class WhisperService: ObservableObject {
             decodingOptions: options
         ) { [weak self] oldState, newState in
             guard let self else { return }
+            let segmentsChanged = oldState.unconfirmedSegments != newState.unconfirmedSegments ||
+                oldState.confirmedSegments != newState.confirmedSegments
             guard oldState.currentText != newState.currentText ||
-                    oldState.unconfirmedSegments != newState.unconfirmedSegments ||
-                    oldState.confirmedSegments != newState.confirmedSegments ||
+                    segmentsChanged ||
                     oldState.isRecording != newState.isRecording
             else {
                 return
             }
 
-            let (confirmed, display) = Self.realtimeTranscriptTexts(from: newState)
             Task { @MainActor in
                 guard self.realtimeSessionID == sessionID else { return }
                 self.realtimeCaptureActive = newState.isRecording
+                // Segment filtering is grounded in the captured audio. Refresh the voiced
+                // frame mask only when the decoder produced new segments; token-by-token
+                // hypothesis updates reuse it.
+                if segmentsChanged || self.realtimeVoicedFrames.isEmpty {
+                    self.realtimeVoicedFrames = SpeechActivityDetector.voicedFrameMask(
+                        self.currentRealtimeCapturedSamples() ?? []
+                    )
+                }
+                let (confirmed, display) = Self.realtimeTranscriptTexts(
+                    from: newState,
+                    voicedFrames: self.realtimeVoicedFrames,
+                    specialTokenBegin: specialTokenBegin
+                )
                 if !display.isEmpty {
                     onTextUpdate(confirmed, display)
                 }
@@ -354,6 +429,7 @@ class WhisperService: ObservableObject {
         let sessionID = UUID()
         realtimeSessionID = sessionID
         realtimeCaptureActive = false
+        realtimeVoicedFrames = []
 
         if let transcriber = realtimeTranscriber {
             await transcriber.stopStreamTranscription()
@@ -385,9 +461,13 @@ class WhisperService: ObservableObject {
     /// Returns (confirmedText, displayText).
     /// confirmedText: only stable segments that won't be revised — safe to insert into the document.
     /// displayText: full transcript including unconfirmed/in-progress text — for overlay display only.
-    private static func realtimeTranscriptTexts(from state: AudioStreamTranscriber.State) -> (confirmed: String, display: String) {
-        let confirmed = filteredSegmentText(state.confirmedSegments)
-        let unconfirmedSegmentsText = filteredSegmentText(state.unconfirmedSegments)
+    private static func realtimeTranscriptTexts(
+        from state: AudioStreamTranscriber.State,
+        voicedFrames: [Bool],
+        specialTokenBegin: Int?
+    ) -> (confirmed: String, display: String) {
+        let confirmed = filteredSegmentText(state.confirmedSegments, voicedFrames: voicedFrames, specialTokenBegin: specialTokenBegin)
+        let unconfirmedSegmentsText = filteredSegmentText(state.unconfirmedSegments, voicedFrames: voicedFrames, specialTokenBegin: specialTokenBegin)
 
         let currentText: String
         if state.currentText == "Waiting for speech..." {
@@ -455,17 +535,21 @@ class WhisperService: ObservableObject {
         }
     }
 
-    private static func filteredSegmentText(_ segments: [TranscriptionSegment]) -> String {
+    private static func filteredSegmentText(
+        _ segments: [TranscriptionSegment],
+        voicedFrames: [Bool],
+        specialTokenBegin: Int?
+    ) -> String {
         segments
-            .filter { segment in
-                !isLikelyHallucination(
-                    text: stripWhisperTokens(segment.text),
-                    noSpeechProb: segment.noSpeechProb,
-                    avgLogprob: segment.avgLogprob
+            .compactMap { segment in
+                acceptedSegmentText(
+                    segment,
+                    voicedFrames: voicedFrames,
+                    specialTokenBegin: specialTokenBegin,
+                    logRejections: false
                 )
             }
-            .map(\.text)
-            .joined()
+            .joined(separator: " ")
     }
 
     /// Phrases Whisper is known to invent when decoding silence or background
@@ -498,12 +582,27 @@ class WhisperService: ObservableObject {
     ]
 
     /// Decides whether a decoded segment is a silence hallucination rather than
-    /// real speech. Known ghost phrases are only dropped when the segment's own
-    /// audio metadata also points at silence, so a genuinely spoken "Thank you."
-    /// (low noSpeechProb, healthy logprob) is preserved.
-    static func isLikelyHallucination(text: String, noSpeechProb: Float, avgLogprob: Float) -> Bool {
+    /// real speech. The microphone is the primary witness: text placed over a span
+    /// the capture shows as silent is dropped whatever it says, and a genuinely
+    /// spoken "Thank you." over voiced audio is kept. Known ghost phrases are
+    /// otherwise only dropped when the segment's own confidence is poor.
+    ///
+    /// `noSpeechProb` is honored for completeness, but WhisperKit (through v1.1.1)
+    /// hard-codes it to 0, so the audio evidence and per-segment log probability
+    /// carry the decision today.
+    static func isLikelyHallucination(
+        text: String,
+        noSpeechProb: Float,
+        avgLogprob: Float,
+        speechEvidence: SpeechActivityDetector.SpeechEvidence
+    ) -> Bool {
         let normalized = normalizedTranscriptPhrase(text)
         guard !normalized.isEmpty else { return true }
+
+        // The microphone recorded no speech where the model placed this text.
+        if speechEvidence == .absent {
+            return true
+        }
 
         // Whisper's own silence heuristic: the model believes the window is
         // non-speech and decoded it with low confidence.

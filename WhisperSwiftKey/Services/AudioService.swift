@@ -117,14 +117,47 @@ class AudioService {
 
 /// Lightweight speech gate used before decoding. It adapts to the current microphone's
 /// noise floor instead of treating common words as hallucinations.
+///
+/// Whisper invents closing phrases such as "Thank you." when a window ends in room noise
+/// or the key click that stopped the recording, and WhisperKit never populates the
+/// no-speech probability that would normally flag those segments. The detector therefore
+/// also answers two audio-grounded questions: where does the speech in a capture start
+/// and end, and did the microphone record speech inside a decoded segment's time span.
 enum SpeechActivityDetector {
-    private static let frameSize = 320 // 20 ms at Whisper's 16 kHz sample rate
+    static let sampleRate = 16_000
+    static let frameSize = 320 // 20 ms at Whisper's 16 kHz sample rate
+
+    /// Frames above the threshold needed before audio counts as speech (~80 ms), so
+    /// clicks and pops are ignored.
+    private static let minimumVoicedFrames = 4
+    /// Consecutive voiced frames needed before a region anchors the speech bounds. Even
+    /// short words last this long (~80 ms); a key click or pop rarely does.
+    private static let minimumRunFrames = 4
+    /// Audio kept ahead of the first voiced run so word onsets survive trimming.
+    static let leadingMarginSamples = 4_800 // 300 ms
+    /// Audio kept after the last voiced run so trailing consonants survive trimming.
+    static let trailingMarginSamples = 8_000 // 500 ms
+    /// WhisperKit decodes nothing from a clip shorter than its one-second window padding,
+    /// so trimmed speech is extended with digital silence to at least this length.
+    static let minimumDecodeSamples = 24_000 // 1.5 s
+
+    enum SpeechEvidence: Equatable {
+        /// The microphone recorded sustained energy inside the span.
+        case present
+        /// The span is silent, lies past the end of the captured audio, or holds only clicks.
+        case absent
+        /// No audio was available, or the span is malformed, so it cannot be judged.
+        case unknown
+    }
 
     static func containsSpeech(_ samples: [Float]) -> Bool {
-        guard samples.count >= frameSize * 4 else { return false }
+        voicedFrameMask(samples).filter { $0 }.count >= minimumVoicedFrames
+    }
 
-        var frameEnergies: [Float] = []
-        frameEnergies.reserveCapacity(samples.count / frameSize)
+    /// RMS energy of each 20 ms frame.
+    static func frameEnergies(_ samples: [Float]) -> [Float] {
+        var energies: [Float] = []
+        energies.reserveCapacity(samples.count / frameSize)
 
         var offset = 0
         while offset + frameSize <= samples.count {
@@ -132,26 +165,89 @@ enum SpeechActivityDetector {
             for sample in samples[offset..<(offset + frameSize)] {
                 sumSquares += sample * sample
             }
-            frameEnergies.append(sqrt(sumSquares / Float(frameSize)))
+            energies.append(sqrt(sumSquares / Float(frameSize)))
             offset += frameSize
         }
+        return energies
+    }
 
-        guard frameEnergies.count >= 4 else { return false }
-        let sorted = frameEnergies.sorted()
+    /// Marks each 20 ms frame as voiced or not, relative to this capture's own noise floor.
+    static func voicedFrameMask(_ samples: [Float]) -> [Bool] {
+        let energies = frameEnergies(samples)
+        guard energies.count >= minimumVoicedFrames else {
+            return Array(repeating: false, count: energies.count)
+        }
+        let threshold = voicedThreshold(forFrameEnergies: energies)
+        return energies.map { $0 >= threshold }
+    }
+
+    /// The quietest fifth of the capture estimates the noise floor; voiced audio must rise
+    /// well above it. The result never drops below the level of digital silence and never
+    /// rises above an absolute floor, because a sustained voice can occupy the whole
+    /// capture and push the local noise estimate as high as the speech itself.
+    private static func voicedThreshold(forFrameEnergies energies: [Float]) -> Float {
+        let sorted = energies.sorted()
         let noiseFloor = sorted[min(sorted.count - 1, max(0, sorted.count / 5))]
-        let adaptiveThreshold = max(0.0025, noiseFloor * 3)
-        let adaptiveSpeechFrames = frameEnergies.filter { $0 >= adaptiveThreshold }.count
+        return min(max(0.0025, noiseFloor * 3), 0.006)
+    }
 
-        // Require approximately 80 ms of voiced audio to avoid reacting to clicks.
-        if adaptiveSpeechFrames >= 4 {
-            return true
+    /// The sample range from the start of the first sustained voiced run to the end of the
+    /// last one, or nil when the capture never contains one. Isolated loud frames such as
+    /// the Fn key click at the end of a recording do not extend the range.
+    static func speechBounds(in samples: [Float]) -> Range<Int>? {
+        let mask = voicedFrameMask(samples)
+        var firstRunStart: Int?
+        var lastRunEnd: Int?
+        var runLength = 0
+
+        for (frame, voiced) in mask.enumerated() {
+            guard voiced else {
+                runLength = 0
+                continue
+            }
+            runLength += 1
+            guard runLength >= minimumRunFrames else { continue }
+            if firstRunStart == nil {
+                firstRunStart = frame - runLength + 1
+            }
+            lastRunEnd = frame + 1
         }
 
-        // A sustained voice can occupy the entire capture, making a purely local
-        // noise estimate as loud as the speech itself. Keep a conservative absolute
-        // floor so that case is recognized without treating digital silence as speech.
-        let absoluteSpeechFrames = frameEnergies.filter { $0 >= 0.006 }.count
-        return absoluteSpeechFrames >= 4
+        guard let firstRunStart, let lastRunEnd else { return nil }
+        return (firstRunStart * frameSize)..<min(samples.count, lastRunEnd * frameSize)
+    }
+
+    /// The capture reduced to its speech plus short margins, extended with digital silence
+    /// when the result is too short for WhisperKit to decode. Returns nil when the capture
+    /// contains no sustained speech.
+    static func trimmedToSpeech(_ samples: [Float]) -> [Float]? {
+        guard let bounds = speechBounds(in: samples) else { return nil }
+        let start = max(0, bounds.lowerBound - leadingMarginSamples)
+        let end = min(samples.count, bounds.upperBound + trailingMarginSamples)
+        var trimmed = Array(samples[start..<end])
+        if trimmed.count < minimumDecodeSamples {
+            trimmed.append(contentsOf: repeatElement(0, count: minimumDecodeSamples - trimmed.count))
+        }
+        return trimmed
+    }
+
+    /// Whether the microphone recorded speech between two timestamps of the audio that
+    /// produced `voicedFrames`. A span that starts past the end of that audio is one Whisper
+    /// stamped into the zero padding after the recording, so it counts as absent.
+    static func speechEvidence(voicedFrames: [Bool], from startSeconds: Float, to endSeconds: Float) -> SpeechEvidence {
+        guard !voicedFrames.isEmpty, startSeconds.isFinite, endSeconds.isFinite else { return .unknown }
+
+        let framesPerSecond = Float(sampleRate) / Float(frameSize)
+        let audioSeconds = Float(voicedFrames.count) / framesPerSecond
+        guard startSeconds < audioSeconds else { return .absent }
+        guard endSeconds > startSeconds else { return .unknown }
+
+        let firstFrame = max(0, Int((startSeconds * framesPerSecond).rounded(.down)))
+        let endFrame = min(voicedFrames.count, Int((min(endSeconds, audioSeconds) * framesPerSecond).rounded(.up)))
+        guard firstFrame < endFrame else { return .absent }
+
+        let voicedCount = voicedFrames[firstFrame..<endFrame].filter { $0 }.count
+        return voicedCount >= minimumVoicedFrames ? .present : .absent
     }
 
     /// Picks a sample index at which a long capture can be split without cutting

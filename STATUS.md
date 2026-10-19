@@ -1,9 +1,9 @@
 # WhisperSwiftKey — Status & Testing Checklist
 
-**Last updated:** 2026-08-18
+**Last updated:** 2026-10-18
 **Branch:** main
 **Current release:** 0.2.0 (build 4)
-**Automated tests:** 21 passing
+**Automated tests:** 28 (26 passing, 2 skipped without Accessibility access)
 
 ## Current functionality
 
@@ -25,7 +25,13 @@
 - Duplicate async finalization is ignored.
 - Browser and terminal bundle identifiers select clipboard insertion.
 - Speech gating rejects silence and accepts short voiced audio.
-- Low-confidence/no-speech Whisper hallucinations are filtered.
+- Captures are trimmed to their speech before decoding; the stop-key click and
+  trailing room noise that make Whisper invent "Thank you." are cut off.
+- Segments stamped over a span with no speech energy are dropped whatever they
+  say, while a genuinely spoken "Thank you." is kept.
+- Per-segment confidence is averaged from the segment's own tokens, because
+  WhisperKit hard-codes `noSpeechProb` to 0 and copies the window-level
+  `avgLogprob` onto every segment.
 - System-audio chunks split at a recent quiet point.
 - A native text view receives the exact streaming hypothesis and exposes caret bounds.
 

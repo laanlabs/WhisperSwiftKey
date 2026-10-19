@@ -123,30 +123,119 @@ final class DictationRegressionTests: XCTestCase {
         XCTAssertFalse(TextInsertionService.usesClipboardOnlyInsertion(bundleID: "com.apple.Notes"))
     }
 
-    func testGhostPhraseFromSilenceIsFiltered() async {
-        // "Thank you." decoded from a silent stretch: elevated no-speech probability.
-        let filtered = await WhisperService.isLikelyHallucination(
+    // MARK: - Hallucination filtering
+    //
+    // WhisperKit hard-codes `noSpeechProb` to 0 and copies the whole window's
+    // `avgLogprob` onto every segment, so a trailing "Thank you." inherits the
+    // confidence of the real speech before it. The app therefore grounds its
+    // filtering in the captured audio, which these tests exercise.
+
+    func testSpeechBoundsIgnoreTheKeyClickThatStoppedTheRecording() {
+        var samples = Array(repeating: Float(0), count: 8_000) // 0.5 s lead-in
+        samples += tone(seconds: 2.0)
+        samples += noise(seconds: 1.5)
+        samples += Array(repeating: Float(0.05), count: 320) // 20 ms key click
+        samples += noise(seconds: 0.3)
+
+        guard let bounds = SpeechActivityDetector.speechBounds(in: samples) else {
+            return XCTFail("Expected speech bounds")
+        }
+        XCTAssertEqual(bounds.lowerBound, 8_000, accuracy: 640)
+        XCTAssertEqual(bounds.upperBound, 8_000 + 32_000, accuracy: 640)
+    }
+
+    func testTrimmingKeepsMarginsAroundSpeechAndDropsTheNoisyTail() {
+        var samples = Array(repeating: Float(0), count: 16_000) // 1 s lead-in
+        samples += tone(seconds: 2.0)
+        samples += noise(seconds: 2.0)
+        samples += Array(repeating: Float(0.05), count: 320) // key click
+
+        guard let trimmed = SpeechActivityDetector.trimmedToSpeech(samples) else {
+            return XCTFail("Expected trimmed speech")
+        }
+        let expected = SpeechActivityDetector.leadingMarginSamples + 32_000 + SpeechActivityDetector.trailingMarginSamples
+        XCTAssertEqual(trimmed.count, expected, accuracy: 640)
+        // The click sat two seconds after the speech ended and must be gone.
+        XCTAssertFalse(trimmed.suffix(8_000).contains { abs($0) >= 0.04 })
+    }
+
+    func testVeryShortUtterancesArePaddedToADecodableLength() {
+        guard let trimmed = SpeechActivityDetector.trimmedToSpeech(tone(seconds: 0.3)) else {
+            return XCTFail("Expected trimmed speech")
+        }
+        XCTAssertGreaterThanOrEqual(trimmed.count, SpeechActivityDetector.minimumDecodeSamples)
+        XCTAssertTrue(trimmed.suffix(8_000).allSatisfy { $0 == 0 })
+    }
+
+    func testTrimmingReturnsNothingWithoutSustainedSpeech() {
+        var samples = noise(seconds: 2.0)
+        samples += Array(repeating: Float(0.05), count: 640) // 40 ms pop
+        samples += noise(seconds: 0.5)
+
+        XCTAssertNil(SpeechActivityDetector.trimmedToSpeech(samples))
+    }
+
+    func testSegmentSpanOverSilentTailHasNoSpeechEvidence() {
+        var samples = tone(seconds: 2.0)
+        samples += Array(repeating: Float(0), count: 16_000)
+        let voiced = SpeechActivityDetector.voicedFrameMask(samples)
+
+        XCTAssertEqual(SpeechActivityDetector.speechEvidence(voicedFrames: voiced, from: 0.5, to: 1.5), .present)
+        XCTAssertEqual(SpeechActivityDetector.speechEvidence(voicedFrames: voiced, from: 2.1, to: 3.0), .absent)
+        // Whisper often stamps a hallucinated tail into the zero padding past the recording.
+        XCTAssertEqual(SpeechActivityDetector.speechEvidence(voicedFrames: voiced, from: 4.0, to: 6.5), .absent)
+        // A malformed span cannot be judged either way.
+        XCTAssertEqual(SpeechActivityDetector.speechEvidence(voicedFrames: voiced, from: 1.0, to: 1.0), .unknown)
+        XCTAssertEqual(SpeechActivityDetector.speechEvidence(voicedFrames: [], from: 0, to: 1), .unknown)
+    }
+
+    func testTextTheMicrophoneContradictsIsFilteredWhateverItSays() async {
+        // Healthy confidence is exactly what a hallucinated tail inherits from the
+        // real speech decoded before it, so it must not rescue the segment.
+        let thankYou = await WhisperService.isLikelyHallucination(
             text: "Thank you.",
-            noSpeechProb: 0.45,
-            avgLogprob: -0.3
+            noSpeechProb: 0,
+            avgLogprob: -0.2,
+            speechEvidence: .absent
         )
-        XCTAssertTrue(filtered)
+        XCTAssertTrue(thankYou)
+
+        let unlistedPhrase = await WhisperService.isLikelyHallucination(
+            text: "See you tomorrow.",
+            noSpeechProb: 0,
+            avgLogprob: -0.2,
+            speechEvidence: .absent
+        )
+        XCTAssertTrue(unlistedPhrase)
     }
 
     func testGenuinelySpokenThankYouIsKept() async {
         let filtered = await WhisperService.isLikelyHallucination(
             text: "Thank you.",
-            noSpeechProb: 0.05,
-            avgLogprob: -0.2
+            noSpeechProb: 0,
+            avgLogprob: -0.2,
+            speechEvidence: .present
         )
         XCTAssertFalse(filtered)
     }
 
-    func testLowConfidenceNonSpeechSegmentIsFilteredRegardlessOfText() async {
+    func testKnownGhostPhraseWithPoorConfidenceIsFilteredWithoutAudio() async {
+        let filtered = await WhisperService.isLikelyHallucination(
+            text: "Thanks for watching!",
+            noSpeechProb: 0,
+            avgLogprob: -0.8,
+            speechEvidence: .unknown
+        )
+        XCTAssertTrue(filtered)
+    }
+
+    func testFutureNoSpeechProbabilityStillFiltersLowConfidenceSegments() async {
+        // WhisperKit reports 0 today; keep honoring the value for when it is implemented.
         let filtered = await WhisperService.isLikelyHallucination(
             text: "The quick brown fox",
             noSpeechProb: 0.8,
-            avgLogprob: -0.9
+            avgLogprob: -0.9,
+            speechEvidence: .unknown
         )
         XCTAssertTrue(filtered)
     }
@@ -154,10 +243,28 @@ final class DictationRegressionTests: XCTestCase {
     func testNormalDictationIsNotFiltered() async {
         let filtered = await WhisperService.isLikelyHallucination(
             text: "Please send the report by Friday.",
-            noSpeechProb: 0.1,
-            avgLogprob: -0.25
+            noSpeechProb: 0,
+            avgLogprob: -0.25,
+            speechEvidence: .unknown
         )
         XCTAssertFalse(filtered)
+    }
+
+    func testSegmentConfidenceAveragesOnlyItsOwnTextTokens() async {
+        let logprobs: [[Int: Float]] = [[50_258: -0.05], [1_000: -0.5], [2_000: -1.5], [50_364: -0.01]]
+        let average = await WhisperService.segmentAverageLogprob(
+            tokenLogProbs: logprobs,
+            specialTokenBegin: 50_257,
+            fallback: -0.1
+        )
+        XCTAssertEqual(average, -1.0, accuracy: 0.001)
+
+        let fallback = await WhisperService.segmentAverageLogprob(
+            tokenLogProbs: [[50_258: -0.05]],
+            specialTokenBegin: 50_257,
+            fallback: -0.3
+        )
+        XCTAssertEqual(fallback, -0.3, accuracy: 0.001)
     }
 
     func testPhraseNormalizationIgnoresCaseAndPunctuation() async {
@@ -165,6 +272,22 @@ final class DictationRegressionTests: XCTestCase {
         XCTAssertEqual(normalized, "thanks for watching")
         let phrases = await WhisperService.hallucinationPhrases
         XCTAssertTrue(phrases.contains(normalized))
+    }
+
+    /// A 220 Hz tone standing in for voiced speech.
+    private func tone(seconds: Double, amplitude: Double = 0.05) -> [Float] {
+        (0..<Int(seconds * 16_000)).map { index in
+            Float(amplitude * sin(2 * .pi * 220 * Double(index) / 16_000))
+        }
+    }
+
+    /// Deterministic low-level room noise.
+    private func noise(seconds: Double, amplitude: Float = 0.001) -> [Float] {
+        var state: UInt32 = 0x1234_5678
+        return (0..<Int(seconds * 16_000)).map { _ in
+            state = state &* 1_664_525 &+ 1_013_904_223
+            return (Float(state) / Float(UInt32.max) * 2 - 1) * amplitude
+        }
     }
 
     func testChunkSplitPrefersTheQuietestRecentMoment() {
